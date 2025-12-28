@@ -1,1 +1,694 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.12.12","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"nvidiaTeslaT4","dataSources":[],"dockerImageVersionId":31236,"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":true}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"import torch\nimport torch.nn as nn\nimport torch.optim as optim\n\nfrom torchvision import datasets, transforms\nfrom torch.utils.data import DataLoader\n\nimport torchmetrics\nimport optuna","metadata":{"_uuid":"8f2839f25d086af736a60e9eeb907d3b93b6e0e5","_cell_guid":"b1076dfc-b9ad-4769-8c92-a6c4dae69d19","trusted":true,"execution":{"iopub.status.busy":"2025-12-27T23:18:42.388665Z","iopub.execute_input":"2025-12-27T23:18:42.389362Z","iopub.status.idle":"2025-12-27T23:18:56.365725Z","shell.execute_reply.started":"2025-12-27T23:18:42.389330Z","shell.execute_reply":"2025-12-27T23:18:56.365152Z"}},"outputs":[{"name":"stderr","text":"/usr/local/lib/python3.12/dist-packages/sqlalchemy/orm/query.py:195: SyntaxWarning: \"is not\" with 'tuple' literal. Did you mean \"!=\"?\n  if entities is not ():\n","output_type":"stream"}],"execution_count":3},{"cell_type":"code","source":"device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\nprint(\"Using device:\", device)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-27T23:18:56.366833Z","iopub.execute_input":"2025-12-27T23:18:56.367305Z","iopub.status.idle":"2025-12-27T23:18:56.453535Z","shell.execute_reply.started":"2025-12-27T23:18:56.367269Z","shell.execute_reply":"2025-12-27T23:18:56.452839Z"}},"outputs":[{"name":"stdout","text":"Using device: cuda\n","output_type":"stream"}],"execution_count":4},{"cell_type":"code","source":"train_transform = transforms.Compose([\n    transforms.RandomHorizontalFlip(p=0.5),\n    transforms.RandomRotation(10),\n    transforms.ColorJitter(0.2, 0.2, 0.2),\n    transforms.ToTensor(),\n    transforms.Normalize(\n        mean=(0.5, 0.5, 0.5),\n        std=(0.5, 0.5, 0.5)\n    )  \n])\n\nval_transform = transforms.Compose([\n    transforms.ToTensor(),\n    transforms.Normalize(\n        mean=(0.5, 0.5, 0.5),\n        std=(0.5, 0.5, 0.5)\n    )\n])\n\ntrain_dataset = datasets.CIFAR10(\n    root=\"./data\",\n    train=True,\n    download=True,\n    transform=train_transform\n)\n\ntest_dataset =datasets.CIFAR10(\n    root=\"./data\",\n    train=False,\n    download=True,\n    transform=val_transform\n)\n\ntrain_loader = DataLoader(\n    train_dataset,\n    batch_size=64,\n    shuffle=True,\n    num_workers=4,\n    pin_memory=True\n)\n\ntest_loader =DataLoader(\n    test_dataset,\n    batch_size=64,\n    shuffle=False,\n    num_workers=4,\n    pin_memory=True\n)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-27T23:18:56.454520Z","iopub.execute_input":"2025-12-27T23:18:56.454876Z","iopub.status.idle":"2025-12-27T23:19:02.675911Z","shell.execute_reply.started":"2025-12-27T23:18:56.454834Z","shell.execute_reply":"2025-12-27T23:19:02.675300Z"}},"outputs":[{"name":"stderr","text":"100%|██████████| 170M/170M [00:03<00:00, 56.0MB/s] \n","output_type":"stream"}],"execution_count":5},{"cell_type":"code","source":"class FlexibleCNN(nn.Module):\n    def __init__(self,\n                 num_blocks,\n                 filters_per_block,\n                 kernel_sizes,\n                 dropouts,\n                 num_fc_units,\n                 fc_units):\n        super().__init__()\n        \n        # --- PARTE 1: Extração de Características (Convoluções) ---\n        convolution_layers = []\n        for i in range(num_blocks):\n            out_channels = filters_per_block[i]\n            \n            convolution_layers.append(\n                nn.LazyConv2d(\n                    out_channels=out_channels,\n                    kernel_size=kernel_sizes[i],\n                    padding=kernel_sizes[i] // 2\n                )\n            )\n            convolution_layers.append(nn.BatchNorm2d(filters_per_block[i]))\n            convolution_layers.append(nn.ReLU())\n            convolution_layers.append(nn.MaxPool2d(2))\n            \n\n        self.feature_extractor = nn.Sequential(*convolution_layers)\n\n        # --- PARTE 2: Classificador (Camadas Densas) ---\n        fc_layers = []\n        for i in range(num_fc_units):\n            fc_layers.append(nn.LazyLinear(fc_units[i]))\n            fc_layers.append(nn.ReLU())\n            fc_layers.append(nn.Dropout(dropouts[i]))\n            \n        self.classifier = nn.Sequential(*fc_layers)\n        # Camada de Saída Final (Fixa em 10)\n        self.output = nn.LazyLinear(10)\n\n    def forward(self, x):\n        x = self.feature_extractor(x)\n        x = torch.flatten(x, 1)\n        x = self.classifier(x)\n        x = self.output(x)\n        return x\n        ","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-27T23:19:02.677118Z","iopub.execute_input":"2025-12-27T23:19:02.677416Z","iopub.status.idle":"2025-12-27T23:19:02.683936Z","shell.execute_reply.started":"2025-12-27T23:19:02.677390Z","shell.execute_reply":"2025-12-27T23:19:02.683307Z"}},"outputs":[],"execution_count":6},{"cell_type":"code","source":"def objective(trial):\n    num_blocks = trial.suggest_int(\"num_blocks\", 1, 3)\n\n    filters_per_block = [\n        trial.suggest_int(f\"filters_block_{i}\", 32, 128)\n        for i in range(num_blocks)\n    ]\n\n    kernel_sizes = [\n        trial.suggest_categorical(f\"kernel_size_{i}\", [3, 5])\n        for i in range(num_blocks)\n    ]\n\n    num_fc_layers = trial.suggest_int(\"num_fc_layers\", 1, 3)\n\n    fc_units = [\n        trial.suggest_int(f\"fc_units_{i}\", 64, 256)\n        for i in range(num_fc_layers)\n    ]\n\n    dropouts = [\n        trial.suggest_float(f\"dropout_{i}\", 0.1, 0.4)\n        for i in range(num_fc_layers)\n    ]\n\n    model = FlexibleCNN(num_blocks, filters_per_block, kernel_sizes, dropouts, num_fc_layers, fc_units).to(device)\n\n    # Dummy pass para inicializar Lazy layers\n    with torch.no_grad():\n        model(torch.randn(1, 3, 32, 32).to(device))\n\n    # Métrica\n    acc_metric = torchmetrics.Accuracy(task=\"multiclass\", num_classes=10).to(device)\n    \n    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)\n    loss_function = nn.CrossEntropyLoss()\n    \n    # Loop de Treino\n    for epoch in range(10):\n        model.train()\n    \n        for images, labels in train_loader:\n            images = images.to(device)\n            labels = labels.to(device)\n    \n            optimizer.zero_grad()\n            outputs = model(images)\n            loss = loss_function(outputs, labels)\n            loss.backward()\n            optimizer.step()\n    \n    # Validação Final\n    model.eval()\n    with torch.no_grad():\n        for images, labels in test_loader:\n            images = images.to(device)\n            labels = labels.to(device)\n            outputs = model(images)\n            acc_metric.update(outputs, labels)\n        \n    return acc_metric.compute().item()","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-27T23:19:09.725120Z","iopub.execute_input":"2025-12-27T23:19:09.725836Z","iopub.status.idle":"2025-12-27T23:19:09.733716Z","shell.execute_reply.started":"2025-12-27T23:19:09.725805Z","shell.execute_reply":"2025-12-27T23:19:09.733001Z"}},"outputs":[],"execution_count":7},{"cell_type":"code","source":"# Criamos o estudo\nstudy = optuna.create_study(direction=\"maximize\")\n\n# Iniciamos as tentativas (ex: 10 vezes)\nstudy.optimize(objective, n_trials=10)\n\nprint(\"\\n--- RESULTADO DA OTIMIZAÇÃO ---\")\nprint(f\"Melhor Acurácia: {study.best_value:.4f}\")\nprint(\"Melhores Parâmetros:\", study.best_params)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-27T23:19:13.731730Z","iopub.execute_input":"2025-12-27T23:19:13.732281Z","iopub.status.idle":"2025-12-27T23:42:31.547640Z","shell.execute_reply.started":"2025-12-27T23:19:13.732221Z","shell.execute_reply":"2025-12-27T23:42:31.546711Z"}},"outputs":[{"name":"stderr","text":"\u001b[32m[I 2025-12-27 23:19:13,733]\u001b[0m A new study created in memory with name: no-name-52071725-4b38-46e4-86ee-4e927997048d\u001b[0m\n\u001b[32m[I 2025-12-27 23:21:33,836]\u001b[0m Trial 0 finished with value: 0.6427000164985657 and parameters: {'num_blocks': 1, 'filters_block_0': 102, 'kernel_size_0': 5, 'num_fc_layers': 2, 'fc_units_0': 240, 'fc_units_1': 67, 'dropout_0': 0.3134770579926872, 'dropout_1': 0.27150987058799164}. Best is trial 0 with value: 0.6427000164985657.\u001b[0m\n\u001b[32m[I 2025-12-27 23:23:51,581]\u001b[0m Trial 1 finished with value: 0.7470999956130981 and parameters: {'num_blocks': 2, 'filters_block_0': 54, 'filters_block_1': 59, 'kernel_size_0': 5, 'kernel_size_1': 5, 'num_fc_layers': 1, 'fc_units_0': 102, 'dropout_0': 0.1108779139776807}. Best is trial 1 with value: 0.7470999956130981.\u001b[0m\n\u001b[32m[I 2025-12-27 23:26:17,645]\u001b[0m Trial 2 finished with value: 0.781499981880188 and parameters: {'num_blocks': 3, 'filters_block_0': 128, 'filters_block_1': 86, 'filters_block_2': 82, 'kernel_size_0': 3, 'kernel_size_1': 5, 'kernel_size_2': 5, 'num_fc_layers': 2, 'fc_units_0': 92, 'fc_units_1': 119, 'dropout_0': 0.19447386703246794, 'dropout_1': 0.3053243857047369}. Best is trial 2 with value: 0.781499981880188.\u001b[0m\n\u001b[32m[I 2025-12-27 23:28:40,468]\u001b[0m Trial 3 finished with value: 0.7372999787330627 and parameters: {'num_blocks': 2, 'filters_block_0': 125, 'filters_block_1': 93, 'kernel_size_0': 5, 'kernel_size_1': 3, 'num_fc_layers': 3, 'fc_units_0': 254, 'fc_units_1': 182, 'fc_units_2': 183, 'dropout_0': 0.2623496488016118, 'dropout_1': 0.32043224281041005, 'dropout_2': 0.15069076102576806}. Best is trial 2 with value: 0.781499981880188.\u001b[0m\n\u001b[32m[I 2025-12-27 23:31:02,836]\u001b[0m Trial 4 finished with value: 0.7261999845504761 and parameters: {'num_blocks': 2, 'filters_block_0': 122, 'filters_block_1': 110, 'kernel_size_0': 3, 'kernel_size_1': 5, 'num_fc_layers': 3, 'fc_units_0': 96, 'fc_units_1': 139, 'fc_units_2': 222, 'dropout_0': 0.12219015229936406, 'dropout_1': 0.22846648359080288, 'dropout_2': 0.3917296559360556}. Best is trial 2 with value: 0.781499981880188.\u001b[0m\n\u001b[32m[I 2025-12-27 23:33:18,544]\u001b[0m Trial 5 finished with value: 0.6252999901771545 and parameters: {'num_blocks': 1, 'filters_block_0': 72, 'kernel_size_0': 3, 'num_fc_layers': 3, 'fc_units_0': 191, 'fc_units_1': 126, 'fc_units_2': 102, 'dropout_0': 0.33208613916641555, 'dropout_1': 0.2973227366652437, 'dropout_2': 0.3669829117375025}. Best is trial 2 with value: 0.781499981880188.\u001b[0m\n\u001b[32m[I 2025-12-27 23:35:33,150]\u001b[0m Trial 6 finished with value: 0.6503000259399414 and parameters: {'num_blocks': 1, 'filters_block_0': 44, 'kernel_size_0': 3, 'num_fc_layers': 2, 'fc_units_0': 251, 'fc_units_1': 163, 'dropout_0': 0.1974840971658967, 'dropout_1': 0.36236870865966275}. Best is trial 2 with value: 0.781499981880188.\u001b[0m\n\u001b[32m[I 2025-12-27 23:37:55,556]\u001b[0m Trial 7 finished with value: 0.7401999831199646 and parameters: {'num_blocks': 2, 'filters_block_0': 113, 'filters_block_1': 113, 'kernel_size_0': 3, 'kernel_size_1': 5, 'num_fc_layers': 3, 'fc_units_0': 231, 'fc_units_1': 94, 'fc_units_2': 101, 'dropout_0': 0.2985899060162073, 'dropout_1': 0.2891332655126192, 'dropout_2': 0.24131231072996315}. Best is trial 2 with value: 0.781499981880188.\u001b[0m\n\u001b[32m[I 2025-12-27 23:40:13,299]\u001b[0m Trial 8 finished with value: 0.7843000292778015 and parameters: {'num_blocks': 3, 'filters_block_0': 82, 'filters_block_1': 63, 'filters_block_2': 120, 'kernel_size_0': 5, 'kernel_size_1': 3, 'kernel_size_2': 3, 'num_fc_layers': 2, 'fc_units_0': 209, 'fc_units_1': 190, 'dropout_0': 0.21287761897250004, 'dropout_1': 0.36566573258198476}. Best is trial 8 with value: 0.7843000292778015.\u001b[0m\n\u001b[32m[I 2025-12-27 23:42:31,542]\u001b[0m Trial 9 finished with value: 0.7483999729156494 and parameters: {'num_blocks': 2, 'filters_block_0': 80, 'filters_block_1': 42, 'kernel_size_0': 5, 'kernel_size_1': 5, 'num_fc_layers': 3, 'fc_units_0': 99, 'fc_units_1': 189, 'fc_units_2': 209, 'dropout_0': 0.1312032936553133, 'dropout_1': 0.182228554706558, 'dropout_2': 0.16091524214679492}. Best is trial 8 with value: 0.7843000292778015.\u001b[0m\n","output_type":"stream"},{"name":"stdout","text":"\n--- RESULTADO DA OTIMIZAÇÃO ---\nMelhor Acurácia: 0.7843\nMelhores Parâmetros: {'num_blocks': 3, 'filters_block_0': 82, 'filters_block_1': 63, 'filters_block_2': 120, 'kernel_size_0': 5, 'kernel_size_1': 3, 'kernel_size_2': 3, 'num_fc_layers': 2, 'fc_units_0': 209, 'fc_units_1': 190, 'dropout_0': 0.21287761897250004, 'dropout_1': 0.36566573258198476}\n","output_type":"stream"}],"execution_count":8},{"cell_type":"code","source":"# 1. Extrair os valores do melhor trial\nbp = study.best_params\n\n# 2. Reconstruir as listas que o modelo espera\nbest_num_blocks = bp[\"num_blocks\"]\n\nbest_filters = [\n    bp[f\"filters_block_{i}\"]\n    for i in range(best_num_blocks)\n]\n\nbest_kernels = [3 for _ in range(best_num_blocks)]  # se kernel foi fixado\n\nbest_num_fc = bp[\"num_fc_layers\"]\n\nbest_fc_units = [\n    bp[f\"fc_units_{i}\"]\n    for i in range(best_num_fc)\n]\n\nbest_dropouts = [\n    bp[f\"dropout_{i}\"]\n    for i in range(best_num_fc)\n]\n\n# 3. Instanciar o modelo vencedor\nbest_model = FlexibleCNN(\n    num_blocks=best_num_blocks,\n    filters_per_block=best_filters,\n    kernel_sizes=best_kernels,\n    dropouts=best_dropouts,\n    num_fc_units=best_num_fc,\n    fc_units=best_fc_units\n)\n\n# 4. Inicializar Lazy layers\nwith torch.no_grad():\n    best_model(torch.randn(1, 3, 32, 32))\n\nbest_model.to(device)\nprint(f\"Modelo movido com sucesso para: {device}\")","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-28T00:01:57.620846Z","iopub.execute_input":"2025-12-28T00:01:57.621658Z","iopub.status.idle":"2025-12-28T00:01:57.642770Z","shell.execute_reply.started":"2025-12-28T00:01:57.621619Z","shell.execute_reply":"2025-12-28T00:01:57.642193Z"}},"outputs":[{"name":"stdout","text":"Modelo movido com sucesso para: cuda\n","output_type":"stream"}],"execution_count":19},{"cell_type":"code","source":"acc_metric = torchmetrics.Accuracy(task=\"multiclass\", num_classes=10).to(device)\n    \noptimizer = optim.Adam(best_model.parameters(), lr=0.001, weight_decay=0.0005)\nloss_function = nn.CrossEntropyLoss()\n\nfor epoch in range(50):\n    best_model.train()\n    running_loss = 0.0\n    \n    for images, labels in train_loader:\n        images = images.to(device)\n        labels = labels.to(device)\n    \n        optimizer.zero_grad()\n        outputs = best_model(images)\n        loss = loss_function(outputs, labels)\n        loss.backward()\n        optimizer.step()\n        running_loss += loss.item()\n    print(\"loss:\", running_loss/len(train_loader))\n\nbest_model.eval()\nwith torch.no_grad():\n    for image, label in test_loader:\n        images = image.to(device)\n        labels = label.to(device)\n        output = best_model(images)\n        acc_metric.update(output, labels)\n\nprint(f\"ACC: {acc_metric.compute():.4f}\")","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-12-28T00:01:58.719665Z","iopub.execute_input":"2025-12-28T00:01:58.719967Z","iopub.status.idle":"2025-12-28T00:13:31.526763Z","shell.execute_reply.started":"2025-12-28T00:01:58.719940Z","shell.execute_reply":"2025-12-28T00:13:31.526031Z"}},"outputs":[{"name":"stdout","text":"loss: 1.4042896690880855\nloss: 1.0572756299429842\nloss: 0.935168511727277\nloss: 0.8681345645271604\nloss: 0.8074015582080387\nloss: 0.7760817193238022\nloss: 0.7366746850788136\nloss: 0.7052897689744945\nloss: 0.6824829485029211\nloss: 0.664602526847054\nloss: 0.645231607053286\nloss: 0.624837741331981\nloss: 0.6125073612803389\nloss: 0.60098578878071\nloss: 0.5872692742844676\nloss: 0.5760582259777561\nloss: 0.5680284385028702\nloss: 0.5582044903579575\nloss: 0.5557828014311583\nloss: 0.5481069938034353\nloss: 0.5400955655118999\nloss: 0.5289791924950412\nloss: 0.5272506111684967\nloss: 0.5240652632454167\nloss: 0.5238816332253043\nloss: 0.5158323424742045\nloss: 0.5077172040443896\nloss: 0.5143864190258334\nloss: 0.5020139596003401\nloss: 0.49960492911469906\nloss: 0.4956856178658088\nloss: 0.49824569387661527\nloss: 0.49893749735849285\nloss: 0.4889123459034564\nloss: 0.49418707809332385\nloss: 0.48788332098813925\nloss: 0.48746526559524217\nloss: 0.47838831205121085\nloss: 0.4807284845377478\nloss: 0.47800521377254934\nloss: 0.4745092180455127\nloss: 0.47675680079499777\nloss: 0.47419099797449454\nloss: 0.4736808269568112\nloss: 0.4708101977320278\nloss: 0.4651210812465919\nloss: 0.4658700772525404\nloss: 0.46555755062557547\nloss: 0.4651289289755285\nloss: 0.4628232508288015\nACC: 0.8152\n","output_type":"stream"}],"execution_count":20}]}
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "ee302f32",
+   "metadata": {
+    "_cell_guid": "b1076dfc-b9ad-4769-8c92-a6c4dae69d19",
+    "_uuid": "8f2839f25d086af736a60e9eeb907d3b93b6e0e5",
+    "execution": {
+     "iopub.execute_input": "2025-12-28T13:58:32.647043Z",
+     "iopub.status.busy": "2025-12-28T13:58:32.646493Z",
+     "iopub.status.idle": "2025-12-28T13:58:48.370299Z",
+     "shell.execute_reply": "2025-12-28T13:58:48.369683Z"
+    },
+    "papermill": {
+     "duration": 15.728992,
+     "end_time": "2025-12-28T13:58:48.372007",
+     "exception": false,
+     "start_time": "2025-12-28T13:58:32.643015",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/usr/local/lib/python3.12/dist-packages/sqlalchemy/orm/query.py:195: SyntaxWarning: \"is not\" with 'tuple' literal. Did you mean \"!=\"?\n",
+      "  if entities is not ():\n"
+     ]
+    }
+   ],
+   "source": [
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.optim as optim\n",
+    "\n",
+    "from torchvision import datasets, transforms\n",
+    "from torch.utils.data import DataLoader\n",
+    "\n",
+    "import torchmetrics\n",
+    "import optuna"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "0fe7403f",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-28T13:58:48.377431Z",
+     "iopub.status.busy": "2025-12-28T13:58:48.376733Z",
+     "iopub.status.idle": "2025-12-28T13:58:48.458282Z",
+     "shell.execute_reply": "2025-12-28T13:58:48.457484Z"
+    },
+    "papermill": {
+     "duration": 0.085513,
+     "end_time": "2025-12-28T13:58:48.459673",
+     "exception": false,
+     "start_time": "2025-12-28T13:58:48.374160",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Using device: cuda\n"
+     ]
+    }
+   ],
+   "source": [
+    "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "print(\"Using device:\", device)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "56e0577a",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-28T13:58:48.464526Z",
+     "iopub.status.busy": "2025-12-28T13:58:48.464281Z",
+     "iopub.status.idle": "2025-12-28T13:58:53.744426Z",
+     "shell.execute_reply": "2025-12-28T13:58:53.743825Z"
+    },
+    "papermill": {
+     "duration": 5.284572,
+     "end_time": "2025-12-28T13:58:53.746110",
+     "exception": false,
+     "start_time": "2025-12-28T13:58:48.461538",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "100%|██████████| 170M/170M [00:02<00:00, 80.5MB/s]\n"
+     ]
+    }
+   ],
+   "source": [
+    "train_transform = transforms.Compose([\n",
+    "    transforms.RandomHorizontalFlip(p=0.5), #melhorar os dados de treino\n",
+    "    transforms.RandomRotation(10),\n",
+    "    transforms.ColorJitter(0.2, 0.2, 0.2),\n",
+    "    \n",
+    "    transforms.ToTensor(),\n",
+    "    transforms.Normalize(\n",
+    "        mean=(0.5, 0.5, 0.5),\n",
+    "        std=(0.5, 0.5, 0.5)\n",
+    "    )  \n",
+    "])\n",
+    "\n",
+    "val_transform = transforms.Compose([\n",
+    "    transforms.ToTensor(),\n",
+    "    transforms.Normalize(\n",
+    "        mean=(0.5, 0.5, 0.5),\n",
+    "        std=(0.5, 0.5, 0.5)\n",
+    "    )\n",
+    "])\n",
+    "\n",
+    "train_dataset = datasets.CIFAR10(\n",
+    "    root=\"./data\",\n",
+    "    train=True,\n",
+    "    download=True,\n",
+    "    transform=train_transform\n",
+    ")\n",
+    "\n",
+    "test_dataset =datasets.CIFAR10(\n",
+    "    root=\"./data\",\n",
+    "    train=False,\n",
+    "    download=True,\n",
+    "    transform=val_transform\n",
+    ")\n",
+    "\n",
+    "train_loader = DataLoader(\n",
+    "    train_dataset,\n",
+    "    batch_size=64,\n",
+    "    shuffle=True,\n",
+    "    num_workers=4, #núcleos cpu\n",
+    "    pin_memory=True\n",
+    ")\n",
+    "\n",
+    "test_loader =DataLoader(\n",
+    "    test_dataset,\n",
+    "    batch_size=64,\n",
+    "    shuffle=False,\n",
+    "    num_workers=4, #núcleos cpu\n",
+    "    pin_memory=True\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "7e429ce3",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-28T13:58:53.753472Z",
+     "iopub.status.busy": "2025-12-28T13:58:53.752878Z",
+     "iopub.status.idle": "2025-12-28T13:58:53.760112Z",
+     "shell.execute_reply": "2025-12-28T13:58:53.759392Z"
+    },
+    "papermill": {
+     "duration": 0.012357,
+     "end_time": "2025-12-28T13:58:53.761561",
+     "exception": false,
+     "start_time": "2025-12-28T13:58:53.749204",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "class FlexibleCNN(nn.Module):\n",
+    "    def __init__(self,\n",
+    "                 num_blocks,\n",
+    "                 filters_per_block,\n",
+    "                 kernel_sizes,\n",
+    "                 dropouts,\n",
+    "                 num_fc_units,\n",
+    "                 fc_units):\n",
+    "        super().__init__()\n",
+    "        \n",
+    "        # --- PARTE 1: Extração de Características (Convoluções) ---\n",
+    "        convolution_layers = []\n",
+    "        for i in range(num_blocks):\n",
+    "            out_channels = filters_per_block[i]\n",
+    "            \n",
+    "            convolution_layers.append(\n",
+    "                nn.LazyConv2d(\n",
+    "                    out_channels=out_channels,\n",
+    "                    kernel_size=kernel_sizes[i],\n",
+    "                    padding=kernel_sizes[i] // 2\n",
+    "                )\n",
+    "            )\n",
+    "            convolution_layers.append(nn.BatchNorm2d(filters_per_block[i]))\n",
+    "            convolution_layers.append(nn.ReLU())\n",
+    "            convolution_layers.append(nn.MaxPool2d(2))\n",
+    "            \n",
+    "\n",
+    "        self.feature_extractor = nn.Sequential(*convolution_layers)\n",
+    "\n",
+    "        # --- PARTE 2: Classificador (Camadas Densas) ---\n",
+    "        fc_layers = []\n",
+    "        for i in range(num_fc_units):\n",
+    "            fc_layers.append(nn.LazyLinear(fc_units[i]))\n",
+    "            fc_layers.append(nn.ReLU())\n",
+    "            fc_layers.append(nn.Dropout(dropouts[i]))\n",
+    "            \n",
+    "        self.classifier = nn.Sequential(*fc_layers)\n",
+    "        # Camada de Saída Final (Fixa em 10)\n",
+    "        self.output = nn.LazyLinear(10)\n",
+    "\n",
+    "    def forward(self, x):\n",
+    "        x = self.feature_extractor(x)\n",
+    "        x = torch.flatten(x, 1)\n",
+    "        x = self.classifier(x)\n",
+    "        x = self.output(x)\n",
+    "        return x\n",
+    "        "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "127db2e6",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-28T13:58:53.768147Z",
+     "iopub.status.busy": "2025-12-28T13:58:53.767928Z",
+     "iopub.status.idle": "2025-12-28T13:58:53.776105Z",
+     "shell.execute_reply": "2025-12-28T13:58:53.775518Z"
+    },
+    "papermill": {
+     "duration": 0.013073,
+     "end_time": "2025-12-28T13:58:53.777528",
+     "exception": false,
+     "start_time": "2025-12-28T13:58:53.764455",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "def objective(trial):\n",
+    "    num_blocks = trial.suggest_int(\"num_blocks\", 1, 3)\n",
+    "\n",
+    "    filters_per_block = [\n",
+    "        trial.suggest_int(f\"filters_block_{i}\", 32, 128)\n",
+    "        for i in range(num_blocks)\n",
+    "    ]\n",
+    "\n",
+    "    kernel_sizes = [\n",
+    "        trial.suggest_categorical(f\"kernel_size_{i}\", [3, 5])\n",
+    "        for i in range(num_blocks)\n",
+    "    ]\n",
+    "\n",
+    "    num_fc_layers = trial.suggest_int(\"num_fc_layers\", 1, 3)\n",
+    "\n",
+    "    fc_units = [\n",
+    "        trial.suggest_int(f\"fc_units_{i}\", 64, 256)\n",
+    "        for i in range(num_fc_layers)\n",
+    "    ]\n",
+    "\n",
+    "    dropouts = [\n",
+    "        trial.suggest_float(f\"dropout_{i}\", 0.1, 0.4)\n",
+    "        for i in range(num_fc_layers)\n",
+    "    ]\n",
+    "\n",
+    "    model = FlexibleCNN(num_blocks, filters_per_block, kernel_sizes, dropouts, num_fc_layers, fc_units).to(device)\n",
+    "\n",
+    "    # Dummy pass para inicializar Lazy layers\n",
+    "    with torch.no_grad():\n",
+    "        model(torch.randn(1, 3, 32, 32).to(device))\n",
+    "\n",
+    "    # Métrica\n",
+    "    acc_metric = torchmetrics.Accuracy(task=\"multiclass\", num_classes=10).to(device)\n",
+    "    \n",
+    "    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)\n",
+    "    loss_function = nn.CrossEntropyLoss()\n",
+    "    \n",
+    "    # Loop de Treino\n",
+    "    for epoch in range(10):\n",
+    "        model.train()\n",
+    "    \n",
+    "        for images, labels in train_loader:\n",
+    "            images = images.to(device)\n",
+    "            labels = labels.to(device)\n",
+    "    \n",
+    "            optimizer.zero_grad()\n",
+    "            outputs = model(images)\n",
+    "            loss = loss_function(outputs, labels)\n",
+    "            loss.backward()\n",
+    "            optimizer.step()\n",
+    "    \n",
+    "    # Validação Final\n",
+    "    model.eval()\n",
+    "    with torch.no_grad():\n",
+    "        for images, labels in test_loader:\n",
+    "            images = images.to(device)\n",
+    "            labels = labels.to(device)\n",
+    "            outputs = model(images)\n",
+    "            acc_metric.update(outputs, labels)\n",
+    "        \n",
+    "    return acc_metric.compute().item()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "e66a97ab",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-28T13:58:53.784757Z",
+     "iopub.status.busy": "2025-12-28T13:58:53.784393Z",
+     "iopub.status.idle": "2025-12-28T14:35:52.656061Z",
+     "shell.execute_reply": "2025-12-28T14:35:52.655297Z"
+    },
+    "papermill": {
+     "duration": 2218.881247,
+     "end_time": "2025-12-28T14:35:52.661664",
+     "exception": false,
+     "start_time": "2025-12-28T13:58:53.780417",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "\u001b[32m[I 2025-12-28 13:58:53,786]\u001b[0m A new study created in memory with name: no-name-d9d1fc7b-ffc1-4611-a570-d6638cb4306b\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:01:18,568]\u001b[0m Trial 0 finished with value: 0.6586999893188477 and parameters: {'num_blocks': 1, 'filters_block_0': 100, 'kernel_size_0': 3, 'num_fc_layers': 3, 'fc_units_0': 152, 'fc_units_1': 135, 'fc_units_2': 128, 'dropout_0': 0.10116223895069545, 'dropout_1': 0.13536348001670429, 'dropout_2': 0.1030262788710622}. Best is trial 0 with value: 0.6586999893188477.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:03:44,988]\u001b[0m Trial 1 finished with value: 0.7587000131607056 and parameters: {'num_blocks': 3, 'filters_block_0': 92, 'filters_block_1': 64, 'filters_block_2': 36, 'kernel_size_0': 5, 'kernel_size_1': 5, 'kernel_size_2': 3, 'num_fc_layers': 2, 'fc_units_0': 108, 'fc_units_1': 164, 'dropout_0': 0.27406376007190386, 'dropout_1': 0.3942802220660345}. Best is trial 1 with value: 0.7587000131607056.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:06:14,349]\u001b[0m Trial 2 finished with value: 0.7549999952316284 and parameters: {'num_blocks': 3, 'filters_block_0': 108, 'filters_block_1': 110, 'filters_block_2': 114, 'kernel_size_0': 5, 'kernel_size_1': 5, 'kernel_size_2': 5, 'num_fc_layers': 1, 'fc_units_0': 235, 'dropout_0': 0.37675875107394174}. Best is trial 1 with value: 0.7587000131607056.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:09:45,622]\u001b[0m Trial 3 finished with value: 0.7427999973297119 and parameters: {'num_blocks': 2, 'filters_block_0': 128, 'filters_block_1': 41, 'kernel_size_0': 3, 'kernel_size_1': 5, 'num_fc_layers': 1, 'fc_units_0': 208, 'dropout_0': 0.10414158812446349}. Best is trial 1 with value: 0.7587000131607056.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:12:05,546]\u001b[0m Trial 4 finished with value: 0.6381000280380249 and parameters: {'num_blocks': 1, 'filters_block_0': 65, 'kernel_size_0': 3, 'num_fc_layers': 3, 'fc_units_0': 119, 'fc_units_1': 250, 'fc_units_2': 148, 'dropout_0': 0.12197818365790912, 'dropout_1': 0.21183950190408404, 'dropout_2': 0.2535651917175849}. Best is trial 1 with value: 0.7587000131607056.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:14:24,899]\u001b[0m Trial 5 finished with value: 0.6473000049591064 and parameters: {'num_blocks': 1, 'filters_block_0': 90, 'kernel_size_0': 5, 'num_fc_layers': 1, 'fc_units_0': 220, 'dropout_0': 0.16220327925050698}. Best is trial 1 with value: 0.7587000131607056.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:16:46,752]\u001b[0m Trial 6 finished with value: 0.6164000034332275 and parameters: {'num_blocks': 1, 'filters_block_0': 113, 'kernel_size_0': 3, 'num_fc_layers': 3, 'fc_units_0': 106, 'fc_units_1': 231, 'fc_units_2': 151, 'dropout_0': 0.24413812154880335, 'dropout_1': 0.38042099420809916, 'dropout_2': 0.11454490501472603}. Best is trial 1 with value: 0.7587000131607056.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:19:06,047]\u001b[0m Trial 7 finished with value: 0.6481000185012817 and parameters: {'num_blocks': 1, 'filters_block_0': 34, 'kernel_size_0': 5, 'num_fc_layers': 2, 'fc_units_0': 180, 'fc_units_1': 172, 'dropout_0': 0.2882415025366237, 'dropout_1': 0.2576761237504137}. Best is trial 1 with value: 0.7587000131607056.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:21:31,697]\u001b[0m Trial 8 finished with value: 0.7767999768257141 and parameters: {'num_blocks': 3, 'filters_block_0': 52, 'filters_block_1': 75, 'filters_block_2': 109, 'kernel_size_0': 3, 'kernel_size_1': 5, 'kernel_size_2': 3, 'num_fc_layers': 3, 'fc_units_0': 167, 'fc_units_1': 150, 'fc_units_2': 212, 'dropout_0': 0.15913310223970048, 'dropout_1': 0.1804115378410932, 'dropout_2': 0.25953097827650917}. Best is trial 8 with value: 0.7767999768257141.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:23:51,670]\u001b[0m Trial 9 finished with value: 0.6588000059127808 and parameters: {'num_blocks': 1, 'filters_block_0': 38, 'kernel_size_0': 5, 'num_fc_layers': 2, 'fc_units_0': 66, 'fc_units_1': 99, 'dropout_0': 0.1499099178262449, 'dropout_1': 0.24750859897410876}. Best is trial 8 with value: 0.7767999768257141.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:26:16,138]\u001b[0m Trial 10 finished with value: 0.7476000189781189 and parameters: {'num_blocks': 2, 'filters_block_0': 62, 'filters_block_1': 93, 'kernel_size_0': 3, 'kernel_size_1': 3, 'num_fc_layers': 3, 'fc_units_0': 158, 'fc_units_1': 74, 'fc_units_2': 246, 'dropout_0': 0.19954038075207098, 'dropout_1': 0.1100471041034913, 'dropout_2': 0.39463442167832924}. Best is trial 8 with value: 0.7767999768257141.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:28:43,052]\u001b[0m Trial 11 finished with value: 0.7648000121116638 and parameters: {'num_blocks': 3, 'filters_block_0': 72, 'filters_block_1': 62, 'filters_block_2': 40, 'kernel_size_0': 5, 'kernel_size_1': 5, 'kernel_size_2': 3, 'num_fc_layers': 2, 'fc_units_0': 122, 'fc_units_1': 175, 'dropout_0': 0.3027704307837294, 'dropout_1': 0.3732373099774023}. Best is trial 8 with value: 0.7767999768257141.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:31:08,076]\u001b[0m Trial 12 finished with value: 0.7750999927520752 and parameters: {'num_blocks': 3, 'filters_block_0': 61, 'filters_block_1': 69, 'filters_block_2': 97, 'kernel_size_0': 3, 'kernel_size_1': 5, 'kernel_size_2': 3, 'num_fc_layers': 2, 'fc_units_0': 185, 'fc_units_1': 200, 'dropout_0': 0.35986104884288506, 'dropout_1': 0.3183864694133173}. Best is trial 8 with value: 0.7767999768257141.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:33:31,208]\u001b[0m Trial 13 finished with value: 0.7889000177383423 and parameters: {'num_blocks': 3, 'filters_block_0': 51, 'filters_block_1': 79, 'filters_block_2': 107, 'kernel_size_0': 3, 'kernel_size_1': 5, 'kernel_size_2': 3, 'num_fc_layers': 2, 'fc_units_0': 177, 'fc_units_1': 210, 'dropout_0': 0.39605198371528916, 'dropout_1': 0.3090776647539773}. Best is trial 13 with value: 0.7889000177383423.\u001b[0m\n",
+      "\u001b[32m[I 2025-12-28 14:35:52,651]\u001b[0m Trial 14 finished with value: 0.7319999933242798 and parameters: {'num_blocks': 2, 'filters_block_0': 48, 'filters_block_1': 91, 'kernel_size_0': 3, 'kernel_size_1': 3, 'num_fc_layers': 3, 'fc_units_0': 189, 'fc_units_1': 206, 'fc_units_2': 236, 'dropout_0': 0.2181133205270189, 'dropout_1': 0.19212502017203337, 'dropout_2': 0.26832099853521757}. Best is trial 13 with value: 0.7889000177383423.\u001b[0m\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "--- RESULTADO DA OTIMIZAÇÃO ---\n",
+      "Melhor Acurácia: 0.7889\n",
+      "Melhores Parâmetros: {'num_blocks': 3, 'filters_block_0': 51, 'filters_block_1': 79, 'filters_block_2': 107, 'kernel_size_0': 3, 'kernel_size_1': 5, 'kernel_size_2': 3, 'num_fc_layers': 2, 'fc_units_0': 177, 'fc_units_1': 210, 'dropout_0': 0.39605198371528916, 'dropout_1': 0.3090776647539773}\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Criamos o estudo\n",
+    "study = optuna.create_study(direction=\"maximize\")\n",
+    "\n",
+    "# Iniciamos as tentativas (ex: 10 vezes)\n",
+    "study.optimize(objective, n_trials=15)\n",
+    "\n",
+    "print(\"\\n--- RESULTADO DA OTIMIZAÇÃO ---\")\n",
+    "print(f\"Melhor Acurácia: {study.best_value:.4f}\")\n",
+    "print(\"Melhores Parâmetros:\", study.best_params)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "0e5cbc89",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-28T14:35:52.669710Z",
+     "iopub.status.busy": "2025-12-28T14:35:52.669403Z",
+     "iopub.status.idle": "2025-12-28T14:35:52.704347Z",
+     "shell.execute_reply": "2025-12-28T14:35:52.703709Z"
+    },
+    "papermill": {
+     "duration": 0.040754,
+     "end_time": "2025-12-28T14:35:52.705629",
+     "exception": false,
+     "start_time": "2025-12-28T14:35:52.664875",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Modelo movido com sucesso para: cuda\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 1. Extrair os valores do melhor trial\n",
+    "bp = study.best_params\n",
+    "\n",
+    "# 2. Reconstruir as listas que o modelo espera\n",
+    "best_num_blocks = bp[\"num_blocks\"]\n",
+    "\n",
+    "best_filters = [\n",
+    "    bp[f\"filters_block_{i}\"]\n",
+    "    for i in range(best_num_blocks)\n",
+    "]\n",
+    "\n",
+    "best_kernels = [3 for _ in range(best_num_blocks)]  # se kernel foi fixado\n",
+    "\n",
+    "best_num_fc = bp[\"num_fc_layers\"]\n",
+    "\n",
+    "best_fc_units = [\n",
+    "    bp[f\"fc_units_{i}\"]\n",
+    "    for i in range(best_num_fc)\n",
+    "]\n",
+    "\n",
+    "best_dropouts = [\n",
+    "    bp[f\"dropout_{i}\"]\n",
+    "    for i in range(best_num_fc)\n",
+    "]\n",
+    "\n",
+    "# 3. Instanciar o modelo vencedor\n",
+    "best_model = FlexibleCNN(\n",
+    "    num_blocks=best_num_blocks,\n",
+    "    filters_per_block=best_filters,\n",
+    "    kernel_sizes=best_kernels,\n",
+    "    dropouts=best_dropouts,\n",
+    "    num_fc_units=best_num_fc,\n",
+    "    fc_units=best_fc_units\n",
+    ")\n",
+    "\n",
+    "# 4. Inicializar Lazy layers\n",
+    "with torch.no_grad():\n",
+    "    best_model(torch.randn(1, 3, 32, 32))\n",
+    "\n",
+    "best_model.to(device)\n",
+    "print(f\"Modelo movido com sucesso para: {device}\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "21ff6d13",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-28T14:35:52.713408Z",
+     "iopub.status.busy": "2025-12-28T14:35:52.712812Z",
+     "iopub.status.idle": "2025-12-28T14:47:38.601747Z",
+     "shell.execute_reply": "2025-12-28T14:47:38.600811Z"
+    },
+    "papermill": {
+     "duration": 705.894473,
+     "end_time": "2025-12-28T14:47:38.603325",
+     "exception": false,
+     "start_time": "2025-12-28T14:35:52.708852",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "training epoch:  0\n",
+      "loss: 1.519767015867526\n",
+      "training epoch:  1\n",
+      "loss: 1.1829857089940239\n",
+      "training epoch:  2\n",
+      "loss: 1.0430213325773663\n",
+      "training epoch:  3\n",
+      "loss: 0.9612734090641636\n",
+      "training epoch:  4\n",
+      "loss: 0.9085509685604164\n",
+      "training epoch:  5\n",
+      "loss: 0.8603341475777004\n",
+      "training epoch:  6\n",
+      "loss: 0.8210163944974884\n",
+      "training epoch:  7\n",
+      "loss: 0.791637986288656\n",
+      "training epoch:  8\n",
+      "loss: 0.7618383250349318\n",
+      "training epoch:  9\n",
+      "loss: 0.7361533551874673\n",
+      "training epoch:  10\n",
+      "loss: 0.7225006070664471\n",
+      "training epoch:  11\n",
+      "loss: 0.7030963406843298\n",
+      "training epoch:  12\n",
+      "loss: 0.6845229756268089\n",
+      "training epoch:  13\n",
+      "loss: 0.6706946201793983\n",
+      "training epoch:  14\n",
+      "loss: 0.6554107630572965\n",
+      "training epoch:  15\n",
+      "loss: 0.6491849651879362\n",
+      "training epoch:  16\n",
+      "loss: 0.6401425405688907\n",
+      "training epoch:  17\n",
+      "loss: 0.6353043811324307\n",
+      "training epoch:  18\n",
+      "loss: 0.6223413989214641\n",
+      "training epoch:  19\n",
+      "loss: 0.6158870584748285\n",
+      "training epoch:  20\n",
+      "loss: 0.6038862667272767\n",
+      "training epoch:  21\n",
+      "loss: 0.6010135178599516\n",
+      "training epoch:  22\n",
+      "loss: 0.5936294143919445\n",
+      "training epoch:  23\n",
+      "loss: 0.5854935389574226\n",
+      "training epoch:  24\n",
+      "loss: 0.5831280876608456\n",
+      "training epoch:  25\n",
+      "loss: 0.5727249070468461\n",
+      "training epoch:  26\n",
+      "loss: 0.5698402584018305\n",
+      "training epoch:  27\n",
+      "loss: 0.5689831227349961\n",
+      "training epoch:  28\n",
+      "loss: 0.5669462560387828\n",
+      "training epoch:  29\n",
+      "loss: 0.5621515471116661\n",
+      "training epoch:  30\n",
+      "loss: 0.5592517820579926\n",
+      "training epoch:  31\n",
+      "loss: 0.5524608551922356\n",
+      "training epoch:  32\n",
+      "loss: 0.5453698795164943\n",
+      "training epoch:  33\n",
+      "loss: 0.5380102861339174\n",
+      "training epoch:  34\n",
+      "loss: 0.5402989516134762\n",
+      "training epoch:  35\n",
+      "loss: 0.5353759547404926\n",
+      "training epoch:  36\n",
+      "loss: 0.535291211913004\n",
+      "training epoch:  37\n",
+      "loss: 0.5308762000268682\n",
+      "training epoch:  38\n",
+      "loss: 0.5326974107633771\n",
+      "training epoch:  39\n",
+      "loss: 0.5271352568588903\n",
+      "training epoch:  40\n",
+      "loss: 0.5205342794775658\n",
+      "training epoch:  41\n",
+      "loss: 0.5187747537937311\n",
+      "training epoch:  42\n",
+      "loss: 0.5130183629481994\n",
+      "training epoch:  43\n",
+      "loss: 0.5173241023326773\n",
+      "training epoch:  44\n",
+      "loss: 0.5138180189006164\n",
+      "training epoch:  45\n",
+      "loss: 0.5151456176967877\n",
+      "training epoch:  46\n",
+      "loss: 0.5098255562507893\n",
+      "training epoch:  47\n",
+      "loss: 0.5041188741164744\n",
+      "training epoch:  48\n",
+      "loss: 0.5082749932470834\n",
+      "training epoch:  49\n",
+      "loss: 0.5013539188963068\n"
+     ]
+    }
+   ],
+   "source": [
+    "acc_metric = torchmetrics.Accuracy(task=\"multiclass\", num_classes=10).to(device)\n",
+    "    \n",
+    "optimizer = optim.Adam(best_model.parameters(), lr=0.001, weight_decay=0.0005)\n",
+    "loss_function = nn.CrossEntropyLoss()\n",
+    "\n",
+    "for epoch in range(50):\n",
+    "    best_model.train()\n",
+    "    running_loss = 0.0\n",
+    "    \n",
+    "    for images, labels in train_loader:\n",
+    "        images = images.to(device)\n",
+    "        labels = labels.to(device)\n",
+    "    \n",
+    "        optimizer.zero_grad()\n",
+    "        outputs = best_model(images)\n",
+    "        loss = loss_function(outputs, labels)\n",
+    "        loss.backward()\n",
+    "        optimizer.step()\n",
+    "        running_loss += loss.item()\n",
+    "        \n",
+    "    print(\"training epoch: \", epoch)\n",
+    "    print(\"loss:\", running_loss/len(train_loader))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "90a2894d",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2025-12-28T14:47:38.614550Z",
+     "iopub.status.busy": "2025-12-28T14:47:38.614302Z",
+     "iopub.status.idle": "2025-12-28T14:47:39.856806Z",
+     "shell.execute_reply": "2025-12-28T14:47:39.855798Z"
+    },
+    "papermill": {
+     "duration": 1.249976,
+     "end_time": "2025-12-28T14:47:39.858371",
+     "exception": false,
+     "start_time": "2025-12-28T14:47:38.608395",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Acurácia: 81.3300\n"
+     ]
+    }
+   ],
+   "source": [
+    "best_model.eval()\n",
+    "with torch.no_grad():\n",
+    "    for image, label in test_loader:\n",
+    "        images = image.to(device)\n",
+    "        labels = label.to(device)\n",
+    "        output = best_model(images)\n",
+    "        acc_metric.update(output, labels)\n",
+    "\n",
+    "print(f\"Acurácia: {acc_metric.compute() * 100 :.4f}\")"
+   ]
+  }
+ ],
+ "metadata": {
+  "kaggle": {
+   "accelerator": "nvidiaTeslaT4",
+   "dataSources": [],
+   "dockerImageVersionId": 31236,
+   "isGpuEnabled": true,
+   "isInternetEnabled": true,
+   "language": "python",
+   "sourceType": "notebook"
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.12"
+  },
+  "papermill": {
+   "default_parameters": {},
+   "duration": 2952.274095,
+   "end_time": "2025-12-28T14:47:42.546063",
+   "environment_variables": {},
+   "exception": null,
+   "input_path": "__notebook__.ipynb",
+   "output_path": "__notebook__.ipynb",
+   "parameters": {},
+   "start_time": "2025-12-28T13:58:30.271968",
+   "version": "2.6.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
